@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body - PDM Microphone to Virtual COM Port
+  * @brief          : Main program body - PDM Mic to FFT/Stream
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -14,51 +14,53 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
-#include <arm_math.h>
-#include "arm_const_structs.h"
-#define CURRENT_MODE MODE_STREAM_PCM
-
-
+#include "arm_math.h" // CMSIS-DSP Library
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+// Створюємо тип для зручного перемикання режимів
+typedef enum {
+  MODE_FFT_ANALYSIS, // Аналіз на мікроконтролері
+  MODE_STREAM_PCM    // Передача сирих даних на ПК
+} OperatingMode;
 /* USER CODE END PTD */
 
-/* Private define ------------------------------------------------------------*/
+/* Private define --------------------------------/ Аналіз на мікроконтролері----------------------------*/
 /* USER CODE BEGIN PD */
+// --- ГОЛОВНІ НАЛАШТУВАННЯ ---
+#define CURRENT_MODE MODE_STREAM_PCM // ОБЕРІТЬ РЕЖИМ ТУТ
 #define PDM_BUF_SIZE 128
 #define PCM_BUF_SIZE 16
-#define FFT_SIZE 512 // 512  1024 2048
-#define SAMPLE_RATE 16000
-
-uint8_t PDM_Buffer[PDM_BUF_SIZE];
-int16_t PCM_Buffer[PCM_BUF_SIZE];
+#define FFT_SIZE 1024       // Розмір FFT (повинен бути ступенем двійки)
+#define SAMPLE_RATE 16000   // Частота дискретизації звуку в Гц
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-arm_rfft_fast_instance_f32 fftHandler;
-
-volatile uint8_t PDM_Half_Transfer = 0;
-volatile uint8_t PDM_Full_Transfer = 0;
-volatile uint8_t FFT_Ready = 0;
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 CRC_HandleTypeDef hcrc;
-
 I2S_HandleTypeDef hi2s2;
 DMA_HandleTypeDef hdma_spi2_rx;
-
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-float32_t fftInput[FFT_SIZE * 2];
+// --- Буфери ---
+uint8_t PDM_Buffer[PDM_BUF_SIZE];
+int16_t PCM_Buffer[PCM_BUF_SIZE];
+
+// --- Змінні для FFT ---
+float32_t pcmAccumulator[FFT_SIZE]; // Буфер для накопичення даних для FFT
+float32_t fftInput[FFT_SIZE];
 float32_t fftOutput[FFT_SIZE];
-float32_t pcmAccumulator[FFT_SIZE];
 uint16_t pcmIndex = 0;
+arm_rfft_fast_instance_f32 fftHandler; // Обробник FFT з бібліотеки CMSIS-DSP
+
+// --- Прапорці для зв'язку між перериваннями та головним циклом ---
+volatile uint8_t PDM_Data_Available = 0; // 0=нема даних, 1=готова перша половина, 2=готова друга
+volatile uint8_t FFT_Ready = 0;          // Прапорець готовності до FFT-аналізу
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -70,60 +72,65 @@ static void MX_USART1_UART_Init(void);
 static void MX_I2S2_Init(void);
 /* USER CODE BEGIN PFP */
 void ProcessFFT(void);
-void FindDominantFrequencyTable(void);
+void FindDominantFrequency(void);
+void AccumulatePCMSamples(int16_t* pcm_data);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void ProcessFFT(void) {
-  for (uint16_t i =0; i<FFT_SIZE;i++) {
-    float32_t window = 0.5f *(1.0 - arm_cos_f32(2.0f*PI*i/(FFT_SIZE-1)));
-    fftInput[i]=(pcmAccumulator[i]/32768.0f)*window;
-  }
-  arm_rfft_fast_f32(&fftHandler,fftInput,fftOutput,0);
-  arm_cmplx_mag_f32(fftOutput,fftOutput, FFT_SIZE/2);
+
+/**
+  * @brief Функція для копіювання нових PCM-семплів у великий буфер для FFT.
+  */
+void AccumulatePCMSamples(int16_t* pcm_data) {
+    for (uint16_t i = 0; i < PCM_BUF_SIZE; i++) {
+        pcmAccumulator[pcmIndex++] = (float32_t)pcm_data[i];
+        // Коли буфер заповнено, встановлюємо прапорець для запуску FFT
+        if (pcmIndex >= FFT_SIZE) {
+            pcmIndex = 0;
+            FFT_Ready = 1;
+        }
+    }
 }
-void FindDominantFrequency(void)
-{
-  char msg[100];
-  uint32_t maxIndex;
-  float32_t maxValue;
 
-  // Пропускаємо низькі частоти (DC та шум) - починаємо з 50 Hz
-  uint16_t startBin = (uint16_t)((50.0f * FFT_SIZE) / SAMPLE_RATE);
-  uint16_t searchSize = (FFT_SIZE / 2) - startBin;
+/**
+  * @brief Виконує FFT-аналіз над накопиченими даними.
+  */
+void ProcessFFT(void) {
+    // Застосовуємо віконну функцію (Ханна) для зменшення "розтікання" спектру
+    for (uint16_t i = 0; i < FFT_SIZE; i++) {
+        float32_t window = 0.5f * (1.0f - arm_cos_f32(2.0f * PI * i / (FFT_SIZE - 1)));
+        // Нормалізуємо int16 в діапазон [-1.0, 1.0] і множимо на вікно
+        fftInput[i] = (pcmAccumulator[i] / 32768.0f) * window;
+    }
+    // Виконуємо дійсне швидке перетворення Фур'є
+    arm_rfft_fast_f32(&fftHandler, fftInput, fftOutput, 0);
+    // Обчислюємо амплітудний спектр (величину комплексних чисел)
+    arm_cmplx_mag_f32(fftOutput, fftOutput, FFT_SIZE / 2);
+}
 
-  // Знаходимо максимум
-  arm_max_f32(&fftOutput[startBin], searchSize, &maxValue, &maxIndex);
+/**
+  * @brief Знаходить домінантну частоту в спектрі та відправляє результат.
+  */
+void FindDominantFrequency(void) {
+    char msg[100];
+    uint32_t maxIndex;
+    float32_t maxValue;
 
-  // Обчислюємо частоту
-  float32_t dominantFreq = ((float32_t)(maxIndex + startBin) * SAMPLE_RATE) / FFT_SIZE;
+    // Ігноруємо перші біни (постійну складову та низькочастотний шум), починаючи з 50 Гц
+    uint16_t startBin = (uint16_t)((50.0f * FFT_SIZE) / SAMPLE_RATE);
+    uint16_t searchSize = (FFT_SIZE / 2) - startBin;
+    if (searchSize <= 0) return;
 
-  sprintf(msg, "Dominant Freq: %.1f Hz (Mag: %.2f)\r\n", dominantFreq, maxValue);
-  HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
+    // Знаходимо індекс максимального значення в спектрі
+    arm_max_f32(&fftOutput[startBin], searchSize, &maxValue, &maxIndex);
 
-  // Топ-5 частот
-  sprintf(msg, "Top 5 frequencies:\r\n");
-  HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
+    // Розраховуємо частоту, що відповідає цьому індексу
+    float32_t dominantFreq = ((float32_t)(maxIndex + startBin) * SAMPLE_RATE) / FFT_SIZE;
 
-  // Копіюємо для пошуку топ-5
-  float32_t fftCopy[FFT_SIZE / 2];
-  arm_copy_f32(fftOutput, fftCopy, FFT_SIZE / 2);
-
-  for (int n = 0; n < 5; n++)
-  {
-    arm_max_f32(&fftCopy[startBin], searchSize, &maxValue, &maxIndex);
-    float32_t freq = ((float32_t)(maxIndex + startBin) * SAMPLE_RATE) / FFT_SIZE;
-
-    sprintf(msg, "  %d: %.1f Hz (%.2f)\r\n", n + 1, freq, maxValue);
+    // Відправляємо результат через UART
+    sprintf(msg, "Dominant Freq: %.1f Hz (Magnitude: %.2f)\r\n", dominantFreq, maxValue);
     HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
-
-    // Обнуляємо знайдений пік
-    fftCopy[maxIndex + startBin] = 0;
-  }
-
-  sprintf(msg, "---\r\n");
-  HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
 }
 
 /* USER CODE END 0 */
@@ -132,166 +139,93 @@ void FindDominantFrequency(void)
   * @brief  The application entry point.
   * @retval int
   */
-int main(void) {
-  /* USER CODE BEGIN 1 */
-  /* USER CODE END 1 */
-
+int main(void)
+{
   /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
-
-  /* USER CODE BEGIN Init */
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
   SystemClock_Config();
-
-  /* USER CODE BEGIN SysInit */
-  /* USER CODE END SysInit */
-
-  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_CRC_Init();
   MX_USART1_UART_Init();
   MX_PDM2PCM_Init();
   MX_I2S2_Init();
+
   /* USER CODE BEGIN 2 */
+  // ВИПРАВЛЕНО: Критично важливий крок! Ініціалізація обробника FFT.
+  // Без цього виклику режим MODE_FFT_ANALYSIS ніколи не запрацює.
+  if (arm_rfft_fast_init_f32(&fftHandler, FFT_SIZE) != ARM_MATH_SUCCESS) {
+      char msg[] = "FFT Init FAILED!\r\n";
+      HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
+      Error_Handler();
+  }
+
+  // Виводимо стартові повідомлення
   char msg[100];
-
-  // Перевірка I2S clock
-  uint32_t i2s_clock = HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_I2S);
-  sprintf(msg, "I2S Clock: %lu Hz\r\n", i2s_clock);
+  sprintf(msg, "\r\n--- System Initialized ---\r\n");
   HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
-
-  sprintf(msg, "PDM Filter initialized\r\n");
-  HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
-
-  sprintf(msg, "Decimation: %d\r\n", PDM1_filter_config.decimation_factor);
-  HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
-
-  sprintf(msg, "Output samples: %d\r\n", PDM1_filter_config.output_samples_number);
-  HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
-
-  // Тестуємо PDM фільтр з тестовими даними
-  uint8_t test_pdm[128];
-  for (int i = 0; i < 128; i++) {
-    test_pdm[i] = 0xAA;  // Паттерн 10101010
-  }
-
-  int16_t test_pcm[16];
-  uint8_t filter_result = MX_PDM2PCM_Process((uint16_t*)test_pdm, (uint16_t*)test_pcm);
-  sprintf(msg, "Filter test result: %d\r\n", filter_result);
-  HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
-
-  if (filter_result == 0) {
-    sprintf(msg, "Test PCM[0-2]: %d %d %d\r\n", test_pcm[0], test_pcm[1], test_pcm[2]);
-    HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
-  }
-
-  HAL_Delay(1000);
-
-  // Очищаємо буфер
-  memset(PDM_Buffer, 0, PDM_BUF_SIZE);
-  memset(pcmAccumulator,0,sizeof(pcmAccumulator));
-  pcmIndex=0;
-  // Запускаємо I2S DMA
-  if (HAL_I2S_Receive_DMA(&hi2s2, (uint16_t*)PDM_Buffer, PDM_BUF_SIZE/2) != HAL_OK) {
-    sprintf(msg, "I2S DMA Start ERROR!\r\n");
-    HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
-    Error_Handler();
+  if (CURRENT_MODE == MODE_FFT_ANALYSIS) {
+      sprintf(msg, "Mode: FFT Analysis on-board\r\nFFT Size: %d\r\n", FFT_SIZE);
   } else {
-    sprintf(msg, "I2S DMA Started OK\r\n");
-    HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
+      sprintf(msg, "Mode: Streaming PCM data to PC\r\n");
   }
-  sprintf(msg, "\r\nListening for audio...\r\n\r\n");
-
   HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
 
+  // Очищуємо буфери
+  memset(PDM_Buffer, 0, PDM_BUF_SIZE);
+  memset(pcmAccumulator, 0, sizeof(pcmAccumulator));
+  pcmIndex = 0;
+
+  // Запускаємо прийом даних з мікрофона через I2S+DMA
+  // HAL-функція очікує розмір у 16-бітних словах, тому ділимо на 2
+  if (HAL_I2S_Receive_DMA(&hi2s2, (uint16_t*)PDM_Buffer, PDM_BUF_SIZE / 2) != HAL_OK) {
+      Error_Handler();
+  }
+  sprintf(msg, "I2S DMA Started. Listening for audio...\r\n\r\n");
+  HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  uint32_t process_count = 0;
   while (1)
   {
     /* USER CODE END WHILE */
-
     /* USER CODE BEGIN 3 */
 
-    // Обробка першої половини буфера
-    if (PDM_Half_Transfer == 1)
-    {
-      PDM_Half_Transfer = 0;
-      process_count++;
-      uint8_t result = MX_PDM2PCM_Process((uint16_t*)&PDM_Buffer[0], (uint16_t*)PCM_Buffer);
+    // ВИПРАВЛЕНО: Повністю переписана логіка для чистоти та ефективності.
+    if (PDM_Data_Available > 0) {
+        uint8_t* pPdmBuf; // Вказівник на ту частину буфера, яка готова
 
-
-      // Діагностика RAW PDM даних
-      if (process_count % 100 == 0) {
-        char dbg[100];
-        sprintf(dbg, "PDM[0-3]: %02X %02X %02X %02X\r\n",
-                PDM_Buffer[0], PDM_Buffer[1], PDM_Buffer[2], PDM_Buffer[3]);
-        HAL_UART_Transmit(&huart1, (uint8_t*)dbg, strlen(dbg), 100);
-      }
-
-      // Конвертуємо PDM → PCM
-      result = MX_PDM2PCM_Process((uint16_t*)&PDM_Buffer[0], (uint16_t*)PCM_Buffer);
-
-      if (result == 0)
-      {
-        // Діагностика PCM даних
-        for (uint16_t i = 0; i < PCM_BUF_SIZE; i++)
-        {
-          pcmAccumulator[pcmIndex++] = (float32_t)PCM_Buffer[i];
-
-          // Коли накопичили достатньо для FFT
-          if (pcmIndex >= FFT_SIZE)
-          {
-            pcmIndex = 0;
-            FFT_Ready = 1;
-          }
+        if (PDM_Data_Available == 1) {
+            pPdmBuf = &PDM_Buffer[0]; // Перша половина
+        } else {
+            pPdmBuf = &PDM_Buffer[PDM_BUF_SIZE / 2]; // Друга половина
         }
+        PDM_Data_Available = 0; // Скидаємо прапорець
 
-        // Відправляємо бінарні дані (розкоментуйте коли все працює)
-        HAL_UART_Transmit(&huart1, (uint8_t*)PCM_Buffer, PCM_BUF_SIZE * 2, 100);
-      }
+        // Конвертуємо PDM в PCM один раз
+        if (MX_PDM2PCM_Process((uint16_t*)pPdmBuf, (uint16_t*)PCM_Buffer) == 0) {
+            // Тепер виконуємо дію залежно від обраного режиму
+            if (CURRENT_MODE == MODE_STREAM_PCM) {
+                // Режим 1: Просто відправляємо сирі дані на ПК
+                HAL_UART_Transmit(&huart1, (uint8_t*)PCM_Buffer, PCM_BUF_SIZE * sizeof(int16_t), 100);
+            } else { // CURRENT_MODE == MODE_FFT_ANALYSIS
+                // Режим 2: Накопичуємо дані для аналізу
+                AccumulatePCMSamples(PCM_Buffer);
+            }
+        }
     }
 
-    if (PDM_Full_Transfer == 1)
-    {
-      PDM_Full_Transfer = 0;
-
-      uint8_t result = MX_PDM2PCM_Process((uint16_t*)&PDM_Buffer[PDM_BUF_SIZE / 2], (uint16_t*)PCM_Buffer);
-
-      if (result == 0)
-      {
-        // for (uint16_t i = 0; i < PCM_BUF_SIZE; i++)
-        // {
-        //   pcmAccumulator[pcmIndex++] = (float32_t)PCM_Buffer[i];
-        //
-        //   if (pcmIndex >= FFT_SIZE)
-        //   {
-        //     pcmIndex = 0;
-        //     FFT_Ready = 1;
-        //   }
-        // }
-         HAL_UART_Transmit(&huart1, (uint8_t*)PCM_Buffer, PCM_BUF_SIZE * 2, 100);
-      }
-      if (FFT_Ready == 1)
-      {
-        FFT_Ready = 0;
-
+    // ВИПРАВЛЕНО: Блок обробки FFT винесено з обробників DMA.
+    // Він спрацює одразу, як тільки накопичиться достатньо даних.
+    if (FFT_Ready == 1) {
+        FFT_Ready = 0; // Скидаємо прапорець
         ProcessFFT();
         FindDominantFrequency();
-      }
     }
   }
-}
-
   /* USER CODE END 3 */
-
+}
 
 /**
   * @brief System Clock Configuration
@@ -301,6 +235,7 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
 
   /** Configure the main internal regulator output voltage
   */
@@ -343,76 +278,56 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+
+  // РЕКОМЕНДАЦІЯ: Для точної частоти дискретизації звуку краще використовувати
+  // окремий тактовий генератор PLLI2S.
+  PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_I2S;
+  PeriphClkInitStruct.PLLI2S.PLLI2SN = 192; // Ці значення потрібно розрахувати
+  PeriphClkInitStruct.PLLI2S.PLLI2SR = 2;  // для вашої точної частоти
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
 /**
   * @brief CRC Initialization Function
-  * @param None
-  * @retval None
   */
 static void MX_CRC_Init(void)
 {
-
-  /* USER CODE BEGIN CRC_Init 0 */
-  /* USER CODE END CRC_Init 0 */
-
-  /* USER CODE BEGIN CRC_Init 1 */
-  /* USER CODE END CRC_Init 1 */
   hcrc.Instance = CRC;
   if (HAL_CRC_Init(&hcrc) != HAL_OK)
   {
     Error_Handler();
   }
   __HAL_CRC_DR_RESET(&hcrc);
-  /* USER CODE BEGIN CRC_Init 2 */
-  /* USER CODE END CRC_Init 2 */
-
 }
 
 /**
   * @brief I2S2 Initialization Function
-  * @param None
-  * @retval None
   */
 static void MX_I2S2_Init(void)
 {
-
-  /* USER CODE BEGIN I2S2_Init 0 */
-  /* USER CODE END I2S2_Init 0 */
-
-  /* USER CODE BEGIN I2S2_Init 1 */
-  /* USER CODE END I2S2_Init 1 */
   hi2s2.Instance = SPI2;
   hi2s2.Init.Mode = I2S_MODE_MASTER_RX;
-  hi2s2.Init.Standard = I2S_STANDARD_PHILIPS;
+  hi2s2.Init.Standard = I2S_STANDARD_LSB;
   hi2s2.Init.DataFormat = I2S_DATAFORMAT_16B;
   hi2s2.Init.MCLKOutput = I2S_MCLKOUTPUT_DISABLE;
-  hi2s2.Init.AudioFreq = I2S_AUDIOFREQ_48K;
+  hi2s2.Init.AudioFreq = I2S_AUDIOFREQ_32K; // Частота I2S_SCK. Справжня аудіо-частота залежить від децимації.
   hi2s2.Init.CPOL = I2S_CPOL_LOW;
-  hi2s2.Init.ClockSource = I2S_CLOCK_PLL;
+  hi2s2.Init.ClockSource = I2S_CLOCK_PLL; // Використовуємо PLLI2S для кращої точності
   hi2s2.Init.FullDuplexMode = I2S_FULLDUPLEXMODE_DISABLE;
   if (HAL_I2S_Init(&hi2s2) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN I2S2_Init 2 */
-  /* USER CODE END I2S2_Init 2 */
-
 }
 
 /**
   * @brief USART1 Initialization Function
-  * @param None
-  * @retval None
   */
 static void MX_USART1_UART_Init(void)
 {
-
-  /* USER CODE BEGIN USART1_Init 0 */
-  /* USER CODE END USART1_Init 0 */
-
-  /* USER CODE BEGIN USART1_Init 1 */
-  /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
   huart1.Init.BaudRate = 115200;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
@@ -425,17 +340,13 @@ static void MX_USART1_UART_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN USART1_Init 2 */
-  /* USER CODE END USART1_Init 2 */
-
 }
 
 /**
-  * Enable DMA controller clock
+  * @brief Enable DMA controller clock
   */
 static void MX_DMA_Init(void)
 {
-
   /* DMA controller clock enable */
   __HAL_RCC_DMA1_CLK_ENABLE();
 
@@ -443,88 +354,66 @@ static void MX_DMA_Init(void)
   /* DMA1_Stream3_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Stream3_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream3_IRQn);
-
 }
 
 /**
   * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
   */
 static void MX_GPIO_Init(void)
 {
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
-  /* USER CODE END MX_GPIO_Init_1 */
-
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
-
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
 
 /**
-  * @brief  Half transfer callback (перша половина буфера заповнена)
+  * @brief  Колбек, що викликається по заповненню першої половини DMA-буфера.
   */
 void HAL_I2S_RxHalfCpltCallback(I2S_HandleTypeDef *hi2s)
 {
-  if (hi2s->Instance == SPI2)
-  {
-    PDM_Half_Transfer = 1;
-  }
+    if (hi2s->Instance == SPI2) {
+        PDM_Data_Available = 1; // Встановлюємо прапорець
+    }
 }
 
 /**
-  * @brief  Full transfer callback (весь буфер заповнений)
+  * @brief  Колбек, що викликається по заповненню всього DMA-буфера.
   */
 void HAL_I2S_RxCpltCallback(I2S_HandleTypeDef *hi2s)
 {
-  if (hi2s->Instance == SPI2)
-  {
-    PDM_Full_Transfer = 1;
-  }
+    if (hi2s->Instance == SPI2) {
+        PDM_Data_Available = 2; // Встановлюємо прапорець
+    }
 }
 
 /**
-  * @brief  Error callback
+  * @brief  Колбек помилки I2S.
   */
 void HAL_I2S_ErrorCallback(I2S_HandleTypeDef *hi2s)
 {
-  if (hi2s->Instance == SPI2)
-  {
-    // Можна додати обробку помилок
-    Error_Handler();
-  }
+    if (hi2s->Instance == SPI2) {
+        Error_Handler();
+    }
 }
 
 /* USER CODE END 4 */
 
 /**
   * @brief  This function is executed in case of error occurrence.
-  * @retval None
   */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
   __disable_irq();
   while (1)
   {
   }
-  /* USER CODE END Error_Handler_Debug */
 }
+
 #ifdef USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
@@ -533,3 +422,4 @@ void assert_failed(uint8_t *file, uint32_t line)
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
+
