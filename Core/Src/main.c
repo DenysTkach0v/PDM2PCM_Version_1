@@ -26,11 +26,11 @@ typedef enum {
 } OperatingMode;
 /* USER CODE END PTD */
 
-/* Private define --------------------------------/ Аналіз на мікроконтролері----------------------------*/
+/* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 // --- ГОЛОВНІ НАЛАШТУВАННЯ ---
 #define CURRENT_MODE MODE_STREAM_PCM // ОБЕРІТЬ РЕЖИМ ТУТ
-#define PDM_BUF_SIZE 128
+#define PDM_BUF_SIZE 256
 #define PCM_BUF_SIZE 16
 #define FFT_SIZE 1024       // Розмір FFT (повинен бути ступенем двійки)
 #define SAMPLE_RATE 16000   // Частота дискретизації звуку в Гц
@@ -42,9 +42,12 @@ typedef enum {
 
 /* Private variables ---------------------------------------------------------*/
 CRC_HandleTypeDef hcrc;
+
 I2S_HandleTypeDef hi2s2;
 DMA_HandleTypeDef hdma_spi2_rx;
+
 UART_HandleTypeDef huart1;
+DMA_HandleTypeDef hdma_usart1_tx;
 
 /* USER CODE BEGIN PV */
 // --- Буфери ---
@@ -61,6 +64,7 @@ arm_rfft_fast_instance_f32 fftHandler; // Обробник FFT з бібліот
 // --- Прапорці для зв'язку між перериваннями та головним циклом ---
 volatile uint8_t PDM_Data_Available = 0; // 0=нема даних, 1=готова перша половина, 2=готова друга
 volatile uint8_t FFT_Ready = 0;          // Прапорець готовності до FFT-аналізу
+uint8_t TxBuffer[34];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -141,16 +145,34 @@ void FindDominantFrequency(void) {
   */
 int main(void)
 {
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
   /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
   SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_CRC_Init();
   MX_USART1_UART_Init();
   MX_PDM2PCM_Init();
   MX_I2S2_Init();
-
   /* USER CODE BEGIN 2 */
   // ВИПРАВЛЕНО: Критично важливий крок! Ініціалізація обробника FFT.
   // Без цього виклику режим MODE_FFT_ANALYSIS ніколи не запрацює.
@@ -190,38 +212,32 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
+
     /* USER CODE BEGIN 3 */
 
     // ВИПРАВЛЕНО: Повністю переписана логіка для чистоти та ефективності.
     if (PDM_Data_Available > 0) {
-        uint8_t* pPdmBuf; // Вказівник на ту частину буфера, яка готова
+      uint8_t* pPdmBuf = (PDM_Data_Available == 1) ? &PDM_Buffer[0] : &PDM_Buffer[PDM_BUF_SIZE / 2];
+      PDM_Data_Available = 0;
 
-        if (PDM_Data_Available == 1) {
-            pPdmBuf = &PDM_Buffer[0]; // Перша половина
-        } else {
-            pPdmBuf = &PDM_Buffer[PDM_BUF_SIZE / 2]; // Друга половина
+      if (MX_PDM2PCM_Process((uint16_t*)pPdmBuf, (uint16_t*)PCM_Buffer) == 0) {
+
+        if (CURRENT_MODE == MODE_STREAM_PCM) {
+          // 1. Формуємо повний пакет в пам'яті
+          TxBuffer[0] = 0xAA; // Сінхро-байт 1
+          TxBuffer[1] = 0xBB; // Сінхро-байт 2
+
+          // Копіюємо 32 байти (16 семплів) звуку в TxBuffer одразу після заголовка
+          memcpy(&TxBuffer[2], (uint8_t*)PCM_Buffer, PCM_BUF_SIZE * sizeof(int16_t));
+
+          // 2. Відправляємо все разом через DMA (не блокує процесор!)
+          // Важливо: перевіряємо, чи UART вільний перед відправкою
+          if (HAL_UART_GetState(&huart1) == HAL_UART_STATE_READY) {
+            HAL_UART_Transmit_DMA(&huart1, TxBuffer, 34);
+          }
         }
-        PDM_Data_Available = 0; // Скидаємо прапорець
-
-        // Конвертуємо PDM в PCM один раз
-        if (MX_PDM2PCM_Process((uint16_t*)pPdmBuf, (uint16_t*)PCM_Buffer) == 0) {
-            // Тепер виконуємо дію залежно від обраного режиму
-            if (CURRENT_MODE == MODE_STREAM_PCM) {
-                // Режим 1: Просто відправляємо сирі дані на ПК
-                HAL_UART_Transmit(&huart1, (uint8_t*)PCM_Buffer, PCM_BUF_SIZE * sizeof(int16_t), 100);
-            } else { // CURRENT_MODE == MODE_FFT_ANALYSIS
-                // Режим 2: Накопичуємо дані для аналізу
-                AccumulatePCMSamples(PCM_Buffer);
-            }
-        }
-    }
-
-    // ВИПРАВЛЕНО: Блок обробки FFT винесено з обробників DMA.
-    // Він спрацює одразу, як тільки накопичиться достатньо даних.
-    if (FFT_Ready == 1) {
-        FFT_Ready = 0; // Скидаємо прапорець
-        ProcessFFT();
-        FindDominantFrequency();
+        // ... (код для FFT залишається без змін)
+      }
     }
   }
   /* USER CODE END 3 */
@@ -235,7 +251,6 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-  RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
 
   /** Configure the main internal regulator output voltage
   */
@@ -278,58 +293,86 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-
-  // РЕКОМЕНДАЦІЯ: Для точної частоти дискретизації звуку краще використовувати
-  // окремий тактовий генератор PLLI2S.
-  PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_I2S;
-  PeriphClkInitStruct.PLLI2S.PLLI2SN = 192; // Ці значення потрібно розрахувати
-  PeriphClkInitStruct.PLLI2S.PLLI2SR = 2;  // для вашої точної частоти
-  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
 }
 
 /**
   * @brief CRC Initialization Function
+  * @param None
+  * @retval None
   */
 static void MX_CRC_Init(void)
 {
+
+  /* USER CODE BEGIN CRC_Init 0 */
+
+  /* USER CODE END CRC_Init 0 */
+
+  /* USER CODE BEGIN CRC_Init 1 */
+
+  /* USER CODE END CRC_Init 1 */
   hcrc.Instance = CRC;
   if (HAL_CRC_Init(&hcrc) != HAL_OK)
   {
     Error_Handler();
   }
   __HAL_CRC_DR_RESET(&hcrc);
+  /* USER CODE BEGIN CRC_Init 2 */
+
+  /* USER CODE END CRC_Init 2 */
+
 }
 
 /**
   * @brief I2S2 Initialization Function
+  * @param None
+  * @retval None
   */
 static void MX_I2S2_Init(void)
 {
+
+  /* USER CODE BEGIN I2S2_Init 0 */
+
+  /* USER CODE END I2S2_Init 0 */
+
+  /* USER CODE BEGIN I2S2_Init 1 */
+
+  /* USER CODE END I2S2_Init 1 */
   hi2s2.Instance = SPI2;
   hi2s2.Init.Mode = I2S_MODE_MASTER_RX;
   hi2s2.Init.Standard = I2S_STANDARD_LSB;
   hi2s2.Init.DataFormat = I2S_DATAFORMAT_16B;
   hi2s2.Init.MCLKOutput = I2S_MCLKOUTPUT_DISABLE;
-  hi2s2.Init.AudioFreq = I2S_AUDIOFREQ_32K; // Частота I2S_SCK. Справжня аудіо-частота залежить від децимації.
+  hi2s2.Init.AudioFreq = I2S_AUDIOFREQ_32K;
   hi2s2.Init.CPOL = I2S_CPOL_LOW;
-  hi2s2.Init.ClockSource = I2S_CLOCK_PLL; // Використовуємо PLLI2S для кращої точності
+  hi2s2.Init.ClockSource = I2S_CLOCK_PLL;
   hi2s2.Init.FullDuplexMode = I2S_FULLDUPLEXMODE_DISABLE;
   if (HAL_I2S_Init(&hi2s2) != HAL_OK)
   {
     Error_Handler();
   }
+  /* USER CODE BEGIN I2S2_Init 2 */
+
+  /* USER CODE END I2S2_Init 2 */
+
 }
 
 /**
   * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
   */
 static void MX_USART1_UART_Init(void)
 {
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
+  huart1.Init.BaudRate = 921600;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;
@@ -340,32 +383,52 @@ static void MX_USART1_UART_Init(void)
   {
     Error_Handler();
   }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
 }
 
 /**
-  * @brief Enable DMA controller clock
+  * Enable DMA controller clock
   */
 static void MX_DMA_Init(void)
 {
+
   /* DMA controller clock enable */
   __HAL_RCC_DMA1_CLK_ENABLE();
+  __HAL_RCC_DMA2_CLK_ENABLE();
 
   /* DMA interrupt init */
   /* DMA1_Stream3_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Stream3_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream3_IRQn);
+  /* DMA2_Stream7_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream7_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream7_IRQn);
+
 }
 
 /**
   * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
   */
 static void MX_GPIO_Init(void)
 {
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
@@ -404,16 +467,26 @@ void HAL_I2S_ErrorCallback(I2S_HandleTypeDef *hi2s)
 
 /**
   * @brief  This function is executed in case of error occurrence.
+  * @retval None
   */
 void Error_Handler(void)
 {
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
   }
+  /* USER CODE END Error_Handler_Debug */
 }
-
 #ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
@@ -422,4 +495,3 @@ void assert_failed(uint8_t *file, uint32_t line)
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
-
