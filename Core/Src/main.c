@@ -26,6 +26,7 @@ typedef enum {
 } OperatingMode;
 /* USER CODE END PTD */
 
+
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 // --- ГОЛОВНІ НАЛАШТУВАННЯ ---
