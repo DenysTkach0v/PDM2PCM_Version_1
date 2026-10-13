@@ -7,6 +7,7 @@
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
+/* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "pdm2pcm.h"
 
@@ -14,27 +15,55 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
-#include "arm_math.h" // CMSIS-DSP Library
+#include "arm_math.h"  // CMSIS-DSP Library
+#include "audio_dsp.h" // Модуль спектрального аналізу та Edge AI
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-// Створюємо тип для зручного перемикання режимів
-typedef enum {
-  MODE_FFT_ANALYSIS, // Аналіз на мікроконтролері
-  MODE_STREAM_PCM    // Передача сирих даних на ПК
-} OperatingMode;
-/* USER CODE END PTD */
 
+/**
+ * @brief Режими роботи пристрою:
+ * MODE_STREAM_PCM : Передача 16-бітного звуку на ПК через UART DMA (пакети 0xAA 0xBB + 32 байти PCM).
+ *                   Використовується для перевірки мікрофона, прослуховування та збору датасету плачу.
+ * MODE_DSP_EDGE_AI: Повний бортовий аналіз на мікроконтролері.
+ *                   Конвертація PDM -> PCM -> Вікно Ханна -> FFT -> MFCC -> TinyML класифікація.
+ */
+typedef enum {
+    MODE_STREAM_PCM = 0, // Стрімінг звуку на комп'ютер
+    MODE_DSP_EDGE_AI = 1 // Обробка та виявлення плачу на STM32
+} OperatingMode_t;
+
+/**
+ * @brief Події подвійного буфера PDM для зв'язку між DMA перериваннями та головним циклом
+ */
+typedef enum {
+    PDM_EVENT_NONE = 0,
+    PDM_EVENT_HALF_READY, // Перша половина PDM буфера готова (байти 0..127)
+    PDM_EVENT_FULL_READY  // Друга половина PDM буфера готова (байти 128..255)
+} PDM_BufferEvent_t;
+
+/* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// --- ГОЛОВНІ НАЛАШТУВАННЯ ---
-#define CURRENT_MODE MODE_STREAM_PCM // ОБЕРІТЬ РЕЖИМ ТУТ
-#define PDM_BUF_SIZE 256
-#define PCM_BUF_SIZE 16
-#define FFT_SIZE 1024       // Розмір FFT (повинен бути ступенем двійки)
-#define SAMPLE_RATE 16000   // Частота дискретизації звуку в Гц
+
+// ==============================================================================
+// ГОЛОВНЕ НАЛАШТУВАННЯ: ОБЕРІТЬ РЕЖИМ ТУТ
+// ==============================================================================
+#define CURRENT_MODE        MODE_DSP_EDGE_AI // або MODE_STREAM_PCM
+
+// ------------------------------------------------------------------------------
+// МАТЕМАТИКА БУФЕРІВ PDM -> PCM:
+// 1. Тактова частота I2S = 1.024 МГц (32 кГц * 32 біти на стерео-фрейм).
+// 2. Коефіцієнт децимації = 64 (PDM1_filter_config.decimation_factor).
+// 3. Частота дискретизації PCM = 1.024 МГц / 64 = 16 000 Гц (16 кГц).
+// 4. За одну половину DMA буфера приймається 128 байт = 1024 біти PDM.
+// 5. 1024 біти PDM / 64 = 16 семплів PCM (16 відліків int16_t = 32 байти звуку).
+// ------------------------------------------------------------------------------
+#define PDM_BUF_SIZE        256 // Розмір DMA буфера PDM у байтах (128 слів по 16 біт)
+#define PCM_BUF_SIZE        16  // Кількість вихідних семплів PCM за одну децимацію
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -51,21 +80,19 @@ UART_HandleTypeDef huart1;
 DMA_HandleTypeDef hdma_usart1_tx;
 
 /* USER CODE BEGIN PV */
-// --- Буфери ---
+
+// Буфери сирого звуку
 uint8_t PDM_Buffer[PDM_BUF_SIZE];
 int16_t PCM_Buffer[PCM_BUF_SIZE];
 
-// --- Змінні для FFT ---
-float32_t pcmAccumulator[FFT_SIZE]; // Буфер для накопичення даних для FFT
-float32_t fftInput[FFT_SIZE];
-float32_t fftOutput[FFT_SIZE];
-uint16_t pcmIndex = 0;
-arm_rfft_fast_instance_f32 fftHandler; // Обробник FFT з бібліотеки CMSIS-DSP
+// Прапорець події від DMA I2S (переривання Half / Full Transfer)
+volatile PDM_BufferEvent_t pdm_event = PDM_EVENT_NONE;
 
-// --- Прапорці для зв'язку між перериваннями та головним циклом ---
-volatile uint8_t PDM_Data_Available = 0; // 0=нема даних, 1=готова перша половина, 2=готова друга
-volatile uint8_t FFT_Ready = 0;          // Прапорець готовності до FFT-аналізу
-uint8_t TxBuffer[34];
+// Подвійний буфер UART TX для стрімінгу на ПК без блокування і спотворень
+// Формат пакета: [0xAA] [0xBB] + [32 байти PCM] = 34 байти
+static uint8_t uart_tx_dma_buf[2][34];
+static uint8_t uart_tx_idx = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -76,66 +103,74 @@ static void MX_CRC_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_I2S2_Init(void);
 /* USER CODE BEGIN PFP */
-void ProcessFFT(void);
-void FindDominantFrequency(void);
-void AccumulatePCMSamples(int16_t* pcm_data);
+static void StreamPCM_To_UART(const int16_t *pcm_data, uint16_t count);
+static void PrintDSPStatus(const AudioFeatures_t *features, const AudioPrediction_t *pred);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
 /**
-  * @brief Функція для копіювання нових PCM-семплів у великий буфер для FFT.
-  */
-void AccumulatePCMSamples(int16_t* pcm_data) {
-    for (uint16_t i = 0; i < PCM_BUF_SIZE; i++) {
-        pcmAccumulator[pcmIndex++] = (float32_t)pcm_data[i];
-        // Коли буфер заповнено, встановлюємо прапорець для запуску FFT
-        if (pcmIndex >= FFT_SIZE) {
-            pcmIndex = 0;
-            FFT_Ready = 1;
+ * @brief Відправка 16-бітного PCM аудіо на ПК через UART DMA (non-blocking).
+ *        Використовує подвійну буферизацію для усунення перешкод у звуці.
+ */
+static void StreamPCM_To_UART(const int16_t *pcm_data, uint16_t count) {
+    if (huart1.gState == HAL_UART_STATE_READY) {
+        // Заголовок синхронізації для ПК скрипта (0xAA, 0xBB)
+        uart_tx_dma_buf[uart_tx_idx][0] = 0xAA;
+        uart_tx_dma_buf[uart_tx_idx][1] = 0xBB;
+
+        // Копіюємо 16 семплів int16 (32 байти)
+        memcpy(&uart_tx_dma_buf[uart_tx_idx][2], pcm_data, count * sizeof(int16_t));
+
+        // Відправляємо через DMA
+        HAL_UART_Transmit_DMA(&huart1, uart_tx_dma_buf[uart_tx_idx], 34);
+
+        // Перемикаємо буфер для наступного виклику
+        uart_tx_idx ^= 1;
+    }
+}
+
+/**
+ * @brief Виведення результатів спектрального аналізу та Edge AI у термінал UART.
+ */
+static void PrintDSPStatus(const AudioFeatures_t *features, const AudioPrediction_t *pred) {
+    static uint32_t last_print = 0;
+    uint32_t now = HAL_GetTick();
+
+    // Друкуємо кожні 250 мс, або негайно, якщо виявлено дитячий плач
+    if ((now - last_print >= 250) || (pred->predicted_class == SOUND_CLASS_BABY_CRY)) {
+        last_print = now;
+        char msg[128];
+
+        if (pred->predicted_class == SOUND_CLASS_BABY_CRY) {
+            LED_RED_ON();
+            LED_GREEN_OFF();
+            snprintf(msg, sizeof(msg),
+                     "\r\n[!!! BABY CRY DETECTED !!!] Pitch: %.1f Hz | CryBand: %.0f%% | CryProb: %.2f\r\n",
+                     features->dominant_frequency,
+                     features->cry_energy_ratio * 100.0f,
+                     pred->prob_baby_cry);
+        } else if (pred->predicted_class == SOUND_CLASS_SPEECH) {
+            LED_RED_OFF();
+            LED_GREEN_ON();
+            snprintf(msg, sizeof(msg),
+                     "[SPEECH] Pitch: %.1f Hz | CryBand: %.0f%% | SpeechProb: %.2f\r\n",
+                     features->dominant_frequency,
+                     features->cry_energy_ratio * 100.0f,
+                     pred->prob_speech);
+        } else {
+            LED_RED_OFF();
+            LED_GREEN_TOGGLE(); // Індикація фонового моніторингу (heartbeat)
+            snprintf(msg, sizeof(msg),
+                     "[NOISE/SILENCE] DomFreq: %.1f Hz | TotalEnergy: %.2f | NoiseProb: %.2f\r\n",
+                     features->dominant_frequency,
+                     features->total_energy,
+                     pred->prob_noise);
         }
+
+        HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 50);
     }
-}
-
-/**
-  * @brief Виконує FFT-аналіз над накопиченими даними.
-  */
-void ProcessFFT(void) {
-    // Застосовуємо віконну функцію (Ханна) для зменшення "розтікання" спектру
-    for (uint16_t i = 0; i < FFT_SIZE; i++) {
-        float32_t window = 0.5f * (1.0f - arm_cos_f32(2.0f * PI * i / (FFT_SIZE - 1)));
-        // Нормалізуємо int16 в діапазон [-1.0, 1.0] і множимо на вікно
-        fftInput[i] = (pcmAccumulator[i] / 32768.0f) * window;
-    }
-    // Виконуємо дійсне швидке перетворення Фур'є
-    arm_rfft_fast_f32(&fftHandler, fftInput, fftOutput, 0);
-    // Обчислюємо амплітудний спектр (величину комплексних чисел)
-    arm_cmplx_mag_f32(fftOutput, fftOutput, FFT_SIZE / 2);
-}
-
-/**
-  * @brief Знаходить домінантну частоту в спектрі та відправляє результат.
-  */
-void FindDominantFrequency(void) {
-    char msg[100];
-    uint32_t maxIndex;
-    float32_t maxValue;
-
-    // Ігноруємо перші біни (постійну складову та низькочастотний шум), починаючи з 50 Гц
-    uint16_t startBin = (uint16_t)((50.0f * FFT_SIZE) / SAMPLE_RATE);
-    uint16_t searchSize = (FFT_SIZE / 2) - startBin;
-    if (searchSize <= 0) return;
-
-    // Знаходимо індекс максимального значення в спектрі
-    arm_max_f32(&fftOutput[startBin], searchSize, &maxValue, &maxIndex);
-
-    // Розраховуємо частоту, що відповідає цьому індексу
-    float32_t dominantFreq = ((float32_t)(maxIndex + startBin) * SAMPLE_RATE) / FFT_SIZE;
-
-    // Відправляємо результат через UART
-    sprintf(msg, "Dominant Freq: %.1f Hz (Magnitude: %.2f)\r\n", dominantFreq, maxValue);
-    HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
 }
 
 /* USER CODE END 0 */
@@ -175,37 +210,36 @@ int main(void)
   MX_PDM2PCM_Init();
   MX_I2S2_Init();
   /* USER CODE BEGIN 2 */
-  // ВИПРАВЛЕНО: Критично важливий крок! Ініціалізація обробника FFT.
-  // Без цього виклику режим MODE_FFT_ANALYSIS ніколи не запрацює.
-  if (arm_rfft_fast_init_f32(&fftHandler, FFT_SIZE) != ARM_MATH_SUCCESS) {
-      char msg[] = "FFT Init FAILED!\r\n";
-      HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
+
+  // 1. Ініціалізація алгоритмічного стеку DSP (CMSIS-DSP RFFT, Hann Window, Mel Filterbank, DCT)
+  if (AudioDSP_Init() != 0) {
+      char err[] = "Audio DSP Init FAILED!\r\n";
+      HAL_UART_Transmit(&huart1, (uint8_t*)err, strlen(err), 100);
       Error_Handler();
   }
 
-  // Виводимо стартові повідомлення
-  char msg[100];
-  sprintf(msg, "\r\n--- System Initialized ---\r\n");
-  HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
-  if (CURRENT_MODE == MODE_FFT_ANALYSIS) {
-      sprintf(msg, "Mode: FFT Analysis on-board\r\nFFT Size: %d\r\n", FFT_SIZE);
-  } else {
-      sprintf(msg, "Mode: Streaming PCM data to PC\r\n");
-  }
-  HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
+  // 2. Стартове інформаційне повідомлення
+  char start_msg[256];
+  snprintf(start_msg, sizeof(start_msg),
+           "\r\n========================================\r\n"
+           " STM32F429 Audio DSP & Edge AI Pipeline\r\n"
+           " PDM Mic: MP34DT01 | Fs: 16000 Hz\r\n"
+           " Active Mode: %s\r\n"
+           "========================================\r\n\r\n",
+           (CURRENT_MODE == MODE_DSP_EDGE_AI) ? "On-board DSP + AI (Cry Detector)" : "PCM Stream to PC");
+  HAL_UART_Transmit(&huart1, (uint8_t*)start_msg, strlen(start_msg), 100);
 
-  // Очищуємо буфери
-  memset(PDM_Buffer, 0, PDM_BUF_SIZE);
-  memset(pcmAccumulator, 0, sizeof(pcmAccumulator));
-  pcmIndex = 0;
+  // 3. Очищення буферів перед стартом
+  memset(PDM_Buffer, 0, sizeof(PDM_Buffer));
+  memset(PCM_Buffer, 0, sizeof(PCM_Buffer));
+  pdm_event = PDM_EVENT_NONE;
 
-  // Запускаємо прийом даних з мікрофона через I2S+DMA
-  // HAL-функція очікує розмір у 16-бітних словах, тому ділимо на 2
+  // 4. Запуск постійного прийому PDM-потоку з мікрофона через I2S + DMA
+  // Розмір вказується у 16-бітних словах, тому ділимо PDM_BUF_SIZE на 2
   if (HAL_I2S_Receive_DMA(&hi2s2, (uint16_t*)PDM_Buffer, PDM_BUF_SIZE / 2) != HAL_OK) {
       Error_Handler();
   }
-  sprintf(msg, "I2S DMA Started. Listening for audio...\r\n\r\n");
-  HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -216,29 +250,45 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-    // ВИПРАВЛЕНО: Повністю переписана логіка для чистоти та ефективності.
-    if (PDM_Data_Available > 0) {
-      uint8_t* pPdmBuf = (PDM_Data_Available == 1) ? &PDM_Buffer[0] : &PDM_Buffer[PDM_BUF_SIZE / 2];
-      PDM_Data_Available = 0;
+    // Перевіряємо, чи DMA заповнив половину (Ping) або повний буфер (Pong)
+    if (pdm_event != PDM_EVENT_NONE)
+    {
+        // Визначаємо адресу поточної готової половини буфера PDM
+        uint16_t *pdm_chunk = (pdm_event == PDM_EVENT_HALF_READY) ?
+                              (uint16_t*)&PDM_Buffer[0] :
+                              (uint16_t*)&PDM_Buffer[PDM_BUF_SIZE / 2];
 
-      if (MX_PDM2PCM_Process((uint16_t*)pPdmBuf, (uint16_t*)PCM_Buffer) == 0) {
+        pdm_event = PDM_EVENT_NONE; // Скидаємо прапорець
 
-        if (CURRENT_MODE == MODE_STREAM_PCM) {
-          // 1. Формуємо повний пакет в пам'яті
-          TxBuffer[0] = 0xAA; // Сінхро-байт 1
-          TxBuffer[1] = 0xBB; // Сінхро-байт 2
+        // КРОК 1: PDM -> PCM Конвертація (Децимація на 64 + цифрова фільтрація)
+        // 1024 біти сирого PDM перетворюються на 16 якісних 16-бітних відліків PCM
+        if (MX_PDM2PCM_Process(pdm_chunk, (uint16_t*)PCM_Buffer) == 0)
+        {
+            if (CURRENT_MODE == MODE_STREAM_PCM)
+            {
+                // Режим 1: Передача звуку на ПК через UART DMA (для запису датасету чи прослуховування)
+                StreamPCM_To_UART(PCM_Buffer, PCM_BUF_SIZE);
+            }
+            else if (CURRENT_MODE == MODE_DSP_EDGE_AI)
+            {
+                // Режим 2: Бортовий аналіз на мікроконтролері
+                // Додаємо нові 16 семплів у буфер накопичення вікна аналізу (512 відліків = 32 мс)
+                if (AudioDSP_FeedSamples(PCM_Buffer, PCM_BUF_SIZE))
+                {
+                    AudioFeatures_t features;
+                    AudioPrediction_t prediction;
 
-          // Копіюємо 32 байти (16 семплів) звуку в TxBuffer одразу після заголовка
-          memcpy(&TxBuffer[2], (uint8_t*)PCM_Buffer, PCM_BUF_SIZE * sizeof(int16_t));
+                    // КРОК 2, 3, 4: Вікно Ханна -> ШПФ (FFT) -> MFCC (Мел-спектр) -> Вилучення ознак
+                    AudioDSP_ProcessFrame(&features);
 
-          // 2. Відправляємо все разом через DMA (не блокує процесор!)
-          // Важливо: перевіряємо, чи UART вільний перед відправкою
-          if (HAL_UART_GetState(&huart1) == HAL_UART_STATE_READY) {
-            HAL_UART_Transmit_DMA(&huart1, TxBuffer, 34);
-          }
+                    // КРОК 5: Класифікація TinyML / Edge AI (Дитячий плач vs Голос vs Шум)
+                    AudioDSP_Classify(&features, &prediction);
+
+                    // Відображення результатів у UART терміналі
+                    PrintDSPStatus(&features, &prediction);
+                }
+            }
         }
-        // ... (код для FFT залишається без змін)
-      }
     }
   }
   /* USER CODE END 3 */
@@ -417,6 +467,8 @@ static void MX_DMA_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
@@ -426,6 +478,17 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOG_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOG, LED_GREEN_PIN | LED_RED_PIN, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : PG13 PG14 (LED3 Green, LED4 Red) */
+  GPIO_InitStruct.Pin = LED_GREEN_PIN | LED_RED_PIN;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -435,22 +498,22 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 /**
-  * @brief  Колбек, що викликається по заповненню першої половини DMA-буфера.
+  * @brief  Колбек, що викликається DMA по заповненню ПЕРШОЇ половини PDM-буфера (Ping).
   */
 void HAL_I2S_RxHalfCpltCallback(I2S_HandleTypeDef *hi2s)
 {
     if (hi2s->Instance == SPI2) {
-        PDM_Data_Available = 1; // Встановлюємо прапорець
+        pdm_event = PDM_EVENT_HALF_READY;
     }
 }
 
 /**
-  * @brief  Колбек, що викликається по заповненню всього DMA-буфера.
+  * @brief  Колбек, що викликається DMA по заповненню ДРУГОЇ половини PDM-буфера (Pong).
   */
 void HAL_I2S_RxCpltCallback(I2S_HandleTypeDef *hi2s)
 {
     if (hi2s->Instance == SPI2) {
-        PDM_Data_Available = 2; // Встановлюємо прапорець
+        pdm_event = PDM_EVENT_FULL_READY;
     }
 }
 

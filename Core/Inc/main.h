@@ -46,7 +46,18 @@ extern "C" {
 
 /* Exported macro ------------------------------------------------------------*/
 /* USER CODE BEGIN EM */
+#define LED_GREEN_PIN        GPIO_PIN_13
+#define LED_GREEN_GPIO_PORT  GPIOG
+#define LED_RED_PIN          GPIO_PIN_14
+#define LED_RED_GPIO_PORT    GPIOG
 
+#define LED_GREEN_ON()       HAL_GPIO_WritePin(LED_GREEN_GPIO_PORT, LED_GREEN_PIN, GPIO_PIN_SET)
+#define LED_GREEN_OFF()      HAL_GPIO_WritePin(LED_GREEN_GPIO_PORT, LED_GREEN_PIN, GPIO_PIN_RESET)
+#define LED_GREEN_TOGGLE()   HAL_GPIO_TogglePin(LED_GREEN_GPIO_PORT, LED_GREEN_PIN)
+
+#define LED_RED_ON()         HAL_GPIO_WritePin(LED_RED_GPIO_PORT, LED_RED_PIN, GPIO_PIN_SET)
+#define LED_RED_OFF()        HAL_GPIO_WritePin(LED_RED_GPIO_PORT, LED_RED_PIN, GPIO_PIN_RESET)
+#define LED_RED_TOGGLE()     HAL_GPIO_TogglePin(LED_RED_GPIO_PORT, LED_RED_PIN)
 /* USER CODE END EM */
 
 /* Exported functions prototypes ---------------------------------------------*/

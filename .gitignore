@@ -1,0 +1,31 @@
+# Build directories
+build/
+bin/
+obj/
+
+# Ninja / CMake generated
+.ninja_deps
+.ninja_log
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+*.elf
+*.bin
+*.hex
+*.map
+
+# IDE configurations
+.idea/
+.vscode/
+*.launch
+*.cproject
+*.project
+*.mxproject.bak
+
+# Python artifacts
+__pycache__/
+*.pyc
+venv/
+.env/
+*.wav
